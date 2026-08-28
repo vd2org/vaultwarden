@@ -319,7 +319,7 @@ async fn sso_login(
         Some((user, _)) if !user.enabled => {
             err!(
                 "This user has been disabled",
-                format!("IP: {}. Username: {}.", client_headers.ip.ip, user.display_name()),
+                format!("IP: {}. Username: {}.", client_headers.ip.ip, user.email),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn
                 }
@@ -582,7 +582,7 @@ async fn authenticated_response(
         result["TwoFactorToken"] = Value::String(token);
     }
 
-    info!("User {} logged in successfully. IP: {}", user.display_name(), ip.ip);
+    info!("User {} logged in successfully. IP: {}", user.email, ip.ip);
     Ok(Json(result))
 }
 
