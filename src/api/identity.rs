@@ -17,7 +17,7 @@ use crate::{
             accounts::{PreloginData, RegisterData, kdf_upgrade, prelogin, register},
             log_user_event,
             two_factor::{
-                authenticator, duo_oidc, email, enforce_2fa_policy, is_twofactor_provider_usable, webauthn, yubikey,
+                authenticator, duo_oidc, email, enforce_2fa_policy, ext2fa, is_twofactor_provider_usable, webauthn, yubikey,
             },
         },
         identity_master_password_policy,
@@ -76,7 +76,7 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             check_is_some(data.device_name.as_ref(), "device_name cannot be blank")?;
             check_is_some(data.device_type.as_ref(), "device_type cannot be blank")?;
 
-            password_login(data, &mut user_id, &conn, &client_header.ip).await
+            password_login(data, &mut user_id, &conn, &client_header).await
         }
         "client_credentials" => {
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
@@ -94,7 +94,7 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             check_is_some(data.device_name.as_ref(), "device_name cannot be blank")?;
             check_is_some(data.device_type.as_ref(), "device_type cannot be blank")?;
 
-            sso_login(data, &mut user_id, &conn, &client_header.ip).await
+            sso_login(data, &mut user_id, &conn, &client_header).await
         }
         "authorization_code" => err!("SSO sign-in is not available"),
         "send_access" => {
@@ -179,11 +179,11 @@ async fn refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonR
 }
 
 // After exchanging the code we need to check first if 2FA is needed before continuing
-async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
+async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, client_headers: &ClientHeaders) -> JsonResult {
     AuthMethod::Sso.check_scope(data.scope.as_ref())?;
 
     // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+    crate::ratelimit::check_limit_login(&client_headers.ip.ip)?;
 
     let (code, code_verifier) = match (data.code.as_ref(), data.code_verifier.as_ref()) {
         (None, _) => err!(
@@ -327,7 +327,7 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
         Some((user, _)) if !user.enabled => {
             err!(
                 "This user has been disabled",
-                format!("IP: {}. Username: {}.", ip.ip, user.email),
+                format!("IP: {}. Username: {}.", client_headers.ip.ip, user.email),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn
                 }
@@ -336,7 +336,7 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
         Some((mut user, sso_user)) => {
             let mut device = get_device(&data, conn, &user).await?;
 
-            let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
+            let twofactor_token = twofactor_auth(&mut user, &data, &mut device, &client_headers, conn).await?;
 
             if user.private_key.is_none() {
                 // User was invited a stub was created
@@ -365,21 +365,29 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
     // We passed 2FA get auth tokens
     let auth_tokens = sso::redeem(&device, &user, data.client_id, sso_user, sso_auth, user_infos, conn).await?;
 
-    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, &client_headers.ip).await
 }
 
-async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
+async fn password_login(
+    data: ConnectData,
+    user_id: &mut Option<UserId>,
+    conn: &DbConn,
+    client_headers: &ClientHeaders,
+) -> JsonResult {
     // Validate scope
     AuthMethod::Password.check_scope(data.scope.as_ref())?;
 
     // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+    crate::ratelimit::check_limit_login(&client_headers.ip.ip)?;
 
     // Get the user
     let username = data.username.as_ref().unwrap().trim();
     let log_username = username.escape_debug();
     let Some(mut user) = User::find_by_mail(username, conn).await else {
-        err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {log_username}.", ip.ip))
+        err!(
+            "Username or password is incorrect. Try again",
+            format!("IP: {}. Username: {log_username}.", client_headers.ip.ip)
+        )
     };
 
     // Set the user_id here to be passed back used for event logging.
@@ -392,7 +400,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
         let Some(auth_request) = AuthRequest::find_by_uuid_and_user(auth_request_id, &user.uuid, conn).await else {
             err!(
                 "Auth request not found. Try again.",
-                format!("IP: {}. Username: {log_username}.", ip.ip),
+                format!("IP: {}. Username: {log_username}.", client_headers.ip.ip),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn,
                 }
@@ -406,12 +414,12 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             || !auth_request.approved.unwrap_or(false)
             || auth_request.authentication_date.is_some()
             || request_expired
-            || ip.ip.to_string() != auth_request.request_ip
+            || client_headers.ip.ip.to_string() != auth_request.request_ip
             || !auth_request.check_access_code(password)
         {
             err!(
                 "Username or access code is incorrect. Try again",
-                format!("IP: {}. Username: {log_username}.", ip.ip),
+                format!("IP: {}. Username: {log_username}.", client_headers.ip.ip),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn,
                 }
@@ -420,7 +428,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     } else if !user.check_valid_password(password) {
         err!(
             "Username or password is incorrect. Try again",
-            format!("IP: {}. Username: {log_username}.", ip.ip),
+            format!("IP: {}. Username: {log_username}.", client_headers.ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn,
             }
@@ -431,7 +439,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     if !user.enabled {
         err!(
             "This user has been disabled",
-            format!("IP: {}. Username: {log_username}.", ip.ip),
+            format!("IP: {}. Username: {log_username}.", client_headers.ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn
             }
@@ -470,7 +478,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
         // We still want the login to fail until they actually verified the email address
         err!(
             "Please verify your email before trying again.",
-            format!("IP: {}. Username: {log_username}.", ip.ip),
+            format!("IP: {}. Username: {log_username}.", client_headers.ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn
             }
@@ -479,7 +487,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
 
     let mut device = get_device(&data, conn, &user).await?;
 
-    let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
+    let twofactor_token = twofactor_auth(&mut user, &data, &mut device, &client_headers, conn).await?;
 
     // Like upstream, an auth request can be used for one login only. Marked after 2FA so a 2FA prompt doesn't use it up.
     if let Some(ref auth_request_id) = data.auth_request
@@ -487,7 +495,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     {
         err!(
             "Username or access code is incorrect. Try again",
-            format!("IP: {}. Username: {log_username}.", ip.ip),
+            format!("IP: {}. Username: {log_username}.", client_headers.ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn,
             }
@@ -496,7 +504,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
 
     let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Password, data.client_id);
 
-    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, &client_headers.ip).await
 }
 
 async fn authenticated_response(
@@ -799,18 +807,26 @@ async fn twofactor_auth(
     user: &mut User,
     data: &ConnectData,
     device: &mut Device,
-    ip: &ClientIp,
+    client_headers: &ClientHeaders,
     conn: &DbConn,
 ) -> ApiResult<Option<String>> {
     let twofactors = TwoFactor::find_by_user(&user.uuid, conn).await;
 
     // No twofactor token if twofactor is disabled
     if twofactors.is_empty() {
-        enforce_2fa_policy(user, &user.uuid, device.atype, &ip.ip, conn).await?;
+        enforce_2fa_policy(user, &user.uuid, device.atype, &client_headers.ip.ip, conn).await?;
         return Ok(None);
     }
 
-    TwoFactorIncomplete::mark_incomplete(&user.uuid, &device.uuid, &device.name, device.atype, ip, conn).await?;
+    TwoFactorIncomplete::mark_incomplete(
+        &user.uuid,
+        &device.uuid,
+        &device.name,
+        device.atype,
+        &client_headers.ip,
+        conn,
+    )
+    .await?;
 
     let twofactor_ids: Vec<_> = twofactors
         .iter()
@@ -823,17 +839,39 @@ async fn twofactor_auth(
         err!("No enabled and usable two factor providers are available for this account")
     }
 
-    let selected_id = data.two_factor_provider.unwrap_or(twofactor_ids[0]); // If we aren't given a two factor provider, assume the first one
-    // Ignore Remember and RecoveryCode Types during this check, these are special
-    if ![TwoFactorType::Remember as i32, TwoFactorType::RecoveryCode as i32].contains(&selected_id)
-        && !twofactor_ids.contains(&selected_id)
-    {
-        err_json!(json_err_twofactor(&twofactor_ids, user, data, conn).await?, "Invalid two factor provider")
-    }
+    let selected_id = {
+        let mut selected_id = data.two_factor_provider.unwrap_or_else(||
+            //Prioritize External2fa if usable
+            if twofactor_ids.contains(&(TwoFactorType::External2fa as i32)) {
+                TwoFactorType::External2fa as i32
+            } else if twofactor_ids.contains(&(TwoFactorType::Authenticator as i32)) {
+                TwoFactorType::Authenticator as i32
+            } else {
+                twofactor_ids[0]
+            }
+        );
+
+        // If External2fa is usable for the current user and YubiKey is selected,
+        // it means External2fa was used.
+        if selected_id == TwoFactorType::YubiKey as i32 && twofactor_ids.contains(&(TwoFactorType::External2fa as i32)) {
+            selected_id = TwoFactorType::External2fa as i32;
+        };
+
+        // Ignore Remember and RecoveryCode Types during this check, these are special
+        if ![TwoFactorType::Remember as i32, TwoFactorType::RecoveryCode as i32].contains(&selected_id)
+            && !twofactor_ids.contains(&selected_id)
+        {
+            err_json!(
+                json_err_twofactor(&twofactor_ids, user, data, client_headers, conn).await?,
+                "Invalid two factor provider"
+            )
+        }
+        selected_id
+    };
 
     // Like upstream, a blank token counts as not provided
     let Some(twofactor_code) = data.two_factor_token.as_deref().filter(|t| !t.trim().is_empty()) else {
-        err_json!(json_err_twofactor(&twofactor_ids, user, data, conn).await?, "2FA token not provided")
+        err_json!(json_err_twofactor(&twofactor_ids, user, data, client_headers, conn).await?, "2FA token not provided")
     };
 
     let selected_twofactor = twofactors.into_iter().find(|tf| tf.atype == selected_id && tf.enabled);
@@ -842,7 +880,14 @@ async fn twofactor_auth(
 
     match TwoFactorType::from_i32(selected_id) {
         Some(TwoFactorType::Authenticator) => {
-            authenticator::validate_totp_code_str(&user.uuid, twofactor_code, &selected_data?, ip, conn).await?;
+            authenticator::validate_totp_code_str(
+                &user.uuid,
+                twofactor_code,
+                &selected_data?,
+                &client_headers.ip,
+                conn,
+            )
+            .await?;
         }
         Some(TwoFactorType::Webauthn) => webauthn::validate_webauthn_login(&user.uuid, twofactor_code, conn).await?,
         Some(TwoFactorType::YubiKey) => yubikey::validate_yubikey_login(twofactor_code, &selected_data?).await?,
@@ -857,7 +902,8 @@ async fn twofactor_auth(
             .await?;
         }
         Some(TwoFactorType::Email) => {
-            email::validate_email_code_str(&user.uuid, twofactor_code, &selected_data?, &ip.ip, conn).await?;
+            email::validate_email_code_str(&user.uuid, twofactor_code, &selected_data?, &client_headers.ip.ip, conn)
+                .await?;
         }
         Some(TwoFactorType::Remember) => {
             match device.twofactor_remember {
@@ -876,7 +922,7 @@ async fn twofactor_auth(
                         device.save(true, conn).await?;
                     }
                     err_json!(
-                        json_err_twofactor(&twofactor_ids, user, data, conn).await?,
+                        json_err_twofactor(&twofactor_ids, user, data, client_headers, conn).await?,
                         "2FA Remember token not provided or expired"
                     )
                 }
@@ -902,13 +948,14 @@ async fn twofactor_auth(
             Device::clear_twofactor_remember_by_user(&user.uuid, conn).await?;
             device.delete_twofactor_remember();
 
-            enforce_2fa_policy(user, &user.uuid, device.atype, &ip.ip, conn).await?;
+            enforce_2fa_policy(user, &user.uuid, device.atype, &client_headers.ip.ip, conn).await?;
 
-            log_user_event(EventType::UserRecovered2fa as i32, &user.uuid, device.atype, &ip.ip, conn).await;
+            log_user_event(EventType::UserRecovered2fa as i32, &user.uuid, device.atype, &client_headers.ip.ip, conn)
+                .await;
 
             if CONFIG.mail_enabled()
                 && let Err(e) =
-                    mail::send_recover_twofactor(&user.email, &ip.ip.to_string(), &Utc::now().naive_utc()).await
+                    mail::send_recover_twofactor(&user.email, &client_headers.ip.ip.to_string(), &Utc::now().naive_utc()).await
             {
                 error!("Error sending two-step login recovered email: {e:#?}");
             }
@@ -917,6 +964,24 @@ async fn twofactor_auth(
             user.totp_recover = None;
             user.save(conn).await?;
         }
+        Some(TwoFactorType::External2fa) => {
+            // Validate via external 2FA provider
+            let validate_req = ext2fa::AuthValidate {
+                id: format!("{}@{}", user.uuid, device.uuid),
+                code: twofactor_code.to_string(),
+            };
+
+            let resp = ext2fa::ext2fa_validate(&validate_req).await?;
+            if !resp.ok {
+                err!(
+                    "Invalid two factor code",
+                    ErrorEvent {
+                        event: EventType::UserFailedLogIn2fa
+                    }
+                )
+            }
+        }
+
         _ => err!(
             "Invalid two factor provider",
             ErrorEvent {
@@ -940,17 +1005,38 @@ fn selected_data(tf: Option<TwoFactor>) -> ApiResult<String> {
     tf.map(|t| t.data).map_res("Two factor doesn't exist")
 }
 
-async fn json_err_twofactor(providers: &[i32], user: &User, data: &ConnectData, conn: &DbConn) -> ApiResult<Value> {
+async fn json_err_twofactor(
+    providers: &[i32],
+    user: &User,
+    data: &ConnectData,
+    client_headers: &ClientHeaders,
+    conn: &DbConn,
+) -> ApiResult<Value> {
     let user_id = &user.uuid;
+
+    // Replace External2fa by YubiKey, because
+    // clients don't recognize custom 2fa providers and show error
+    let filtered_providers = {
+        let mut p = providers.to_vec();
+        if let Some(idx) = p.iter().position(|&x| x == TwoFactorType::External2fa as i32) {
+            p.remove(idx); // Removes the item at this index
+            if !p.contains(&(TwoFactorType::YubiKey as i32)) {
+                p.push(TwoFactorType::YubiKey as i32);
+            }
+        }
+        p
+    };
+
     let mut result = json!({
         "error" : "invalid_grant",
         "error_description" : "Two factor required.",
-        "TwoFactorProviders" : providers.iter().map(ToString::to_string).collect::<Vec<String>>(),
+        "TwoFactorProviders" : filtered_providers.iter().map(ToString::to_string).collect::<Vec<String>>(),
         "TwoFactorProviders2" : {}, // { "0" : null }
         "MasterPasswordPolicy": identity_master_password_policy(user, conn).await,
     });
 
-    for provider in providers {
+
+    for provider in &filtered_providers {
         result["TwoFactorProviders2"][provider.to_string()] = Value::Null;
 
         match TwoFactorType::from_i32(*provider) {
@@ -970,6 +1056,55 @@ async fn json_err_twofactor(providers: &[i32], user: &User, data: &ConnectData, 
 
                 result["TwoFactorProviders2"][provider.to_string()] = json!({
                     "AuthUrl": auth_url,
+                });
+            }
+
+            //Faking YubiKey metadata if External2fa is used to make clients show the 2FA prompt
+            Some(TwoFactorType::YubiKey) if providers.contains(&(TwoFactorType::External2fa as i32)) => {
+                // Sending ext2fa request to notify external provider about login attempt
+                let Some(twofactor) =
+                    TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::External2fa as i32, conn).await
+                else {
+                    err!("Bad 2fa data")
+                };
+
+                let Some(User {
+                    uuid,
+                    email,
+                    ..
+                }) = User::find_by_uuid(&user.uuid, conn).await
+                else {
+                    err!("User does not exist")
+                };
+
+                let device_id =
+                    data.device_identifier.as_ref().map(|d| d.to_string()).map_res("Can't extract device_id")?;
+
+                let request_id = format!("{}@{}", uuid, device_id);
+
+                let auth_req = ext2fa::AuthRequest {
+                    id: request_id,
+                    meta_data: ext2fa::MetaData {
+                        username: email,
+                        device_name: data.device_name.clone().unwrap_or_default(),
+                        ip_addr: client_headers.ip.ip,
+                    },
+                    second_factor_data: serde_json::from_str(&twofactor.data).map_res("Bad 2fa data")?,
+                };
+
+                match ext2fa::ext2fa_request(&auth_req).await {
+                    Ok(resp) => {
+                        if !resp.ok {
+                            error!("External 2FA request returned not ok: {:?}", resp.description);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to send request to external 2FA provider: {:?}", e);
+                    }
+                };
+
+                result["TwoFactorProviders2"][provider.to_string()] = json!({
+                    "Nfc": false,
                 });
             }
 
@@ -999,6 +1134,7 @@ async fn json_err_twofactor(providers: &[i32], user: &User, data: &ConnectData, 
             None
             | Some(
                 TwoFactorType::Authenticator
+                | TwoFactorType::External2fa
                 | TwoFactorType::EmailVerificationChallenge
                 | TwoFactorType::OrganizationDuo
                 | TwoFactorType::ProtectedActions
@@ -1106,7 +1242,7 @@ async fn register_finish(data: Json<RegisterData>, ip: ClientIp, conn: DbConn) -
 // https://github.com/bitwarden/jslib/blob/master/common/src/models/request/tokenRequest.ts
 // https://github.com/bitwarden/mobile/blob/master/src/Core/Models/Request/TokenRequest.cs
 #[derive(Debug, Clone, Default, FromForm)]
-struct ConnectData {
+pub struct ConnectData {
     #[field(name = uncased("grant_type"))]
     #[field(name = uncased("granttype"))]
     grant_type: String, // refresh_token, password, client_credentials (API key)
